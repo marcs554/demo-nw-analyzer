@@ -2,7 +2,7 @@ import subprocess
 import argparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from os import makedirs
 from os import getcwd
 import paramiko
@@ -18,37 +18,29 @@ class Networker():
     tshark_pcap = None
     tshark_std = None
     buffer_lock = Lock()
+    thread_pcap:Thread = None
+    thread_pdml:Thread = None
+    is_done = Event()
+
+
 
     def __init__(self, iface: str, filter: str, user: str, direction: str, lua_script: str, passwd: str) -> None:
         self.cmd_tcpdump = f"sudo tcpdump -i {iface} -U -w -"
 
         self.cmd_tshark_pcap = [
-            "tshark",
-            "-l",
-            "-r", "-",
-            "-X", f"lua_script:{lua_script}",
+            "tshark", "-l",
+            "-r", "-", "-X", f"lua_script:{lua_script}",
             "-w", f"./logs/{datetime.now().strftime('%Y%m%d_%H%m%S')}.pcap"
         ]
+        self.cmd_tshark_std = [
+            "tshark", "-l",
+            "-r", "-", "-X", f"lua_script:{lua_script}",
+            "-T", "pdml","-q"
+        ]
 
-        if filter != None:
-            self.cmd_tshark_std = [
-                "tshark",
-                "-l",
-                "-r", "-",
-                "-X", f"lua_script:{lua_script}",
-                "-T", "pdml",
-                "-Y", filter,
-                "-q"
-            ]
-        else:
-            self.cmd_tshark_std = [
-                "tshark",
-                "-l",
-                "-r", "-",
-                "-X", f"lua_script:{lua_script}",
-                "-T", "pdml",
-                "-q"
-            ]
+        if filter:
+            self.cmd_tshark_std.insert(-1, "-Y")
+            self.cmd_tshark_std.insert(-1, filter)
 
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -56,6 +48,7 @@ class Networker():
 
     def start_sniff(self):
         self.stdin, self.stdout, self.stderr = self.ssh.exec_command(self.cmd_tcpdump)
+
         self.tshark_pcap = subprocess.Popen(
             self.cmd_tshark_pcap,
             stdin=subprocess.PIPE,
@@ -72,26 +65,38 @@ class Networker():
             bufsize=0
         )
 
-        Thread(target=self._feed_tshark, daemon=True).start()
-        Thread(target=self._read_pdml, daemon=True).start()
+        self.thread_pcap = Thread(target=self._feed_tshark, daemon=True)
+        self.thread_pdml = Thread(target=self._read_pdml, daemon=True)
+
+        self.thread_pcap.start()
+        self.thread_pdml.start()
 
 
     def _feed_tshark(self):
-        while self.is_reading:
-            data = self.stdout.read(8192)
-            if not data:
-                break
-            self.tshark_pcap.stdin.write(data)
-            self.tshark_pcap.stdin.flush()
+        try:
+            while not self.is_done.is_set():
+                data = self.stdout.read(8192)
+                if not data:
+                    break
 
-            self.tshark_std.stdin.write(data)
-            self.tshark_std.stdin.flush()
+                for p in (self.tshark_pcap, self.tshark_std):
+                    try:
+                        p.stdin.write(data)
+                        p.stdin.flush()
+                    except (BrokenPipeError, ValueError):
+                        return
+        finally:
+            for p in (self.tshark_std, self.tshark_pcap):
+                try:
+                    p.stdin.close()
+                except:
+                    pass
 
 
     def _read_pdml(self):
         packet_buffer = []
 
-        while self.is_reading:
+        while not self.is_done.is_set():
             line = self.tshark_std.stdout.readline()
             if not line:
                 break
@@ -104,53 +109,44 @@ class Networker():
                 packet_buffer.append(decoded)
 
             if decoded.endswith("</packet>") and packet_buffer:
-                xml_packet = "\n".join(packet_buffer)
-
                 try:
-                    element = ET.fromstring(xml_packet)
+                    element = ET.fromstring("\n".join(packet_buffer))
                     self.buffer_pkgs.append(element)
-                except ET.ParseError as e:
-                    print(f"PDML parse error: {e}")
+                except ET.ParseError:
+                    pass
 
                 packet_buffer.clear()
 
     def stop_sniff(self):
-        self.is_reading = False
+        self.is_done.set()
 
-        try:
-            self.tshark_std.stdin.close()
-        except:
-            pass
+        self.ssh.exec_command("sudo killall tcpdump")
 
-        try:
-            self.tshark_pcap.stdin.close()
-        except:
-            pass
+        self.thread_pcap.join()
 
         self.tshark_pcap.terminate()
         self.tshark_std.terminate()
+
         self.ssh.close()
 
     def clean_stdout_network_data(self):
-        self.buffer_pkgs.clear()
+        with self.buffer_lock:
+            self.buffer_pkgs.clear()
 
     def check_stdout_ntw_directly(self, timeout: int, pattern: str):
         t_before = datetime.now()
 
-        while True:
-            if (datetime.now() - t_before).total_seconds() > timeout:
-                return None, False
-
+        while not (datetime.now() - t_before).total_seconds() > timeout:
             with self.buffer_lock:
-                pkgs = self.buffer_pkgs
+                pkgs = list(self.buffer_pkgs)
 
             for pkg in pkgs:
-                res = pkg.findall(pattern)
-                if len(res) > 0:
-                    print(ET.tostring(pkg, encoding='unicode'))
+                if pkg.findall(pattern):
                     return pkg, True
 
             sleep(0.01)
+
+        return None, False
 
 
 def main():
@@ -206,6 +202,7 @@ def main():
     networker.start_sniff()
 
     print(networker.check_stdout_ntw_directly(30, './/proto[@name="frame"]'))
+    # sleep(15)
 
     networker.stop_sniff()
 
